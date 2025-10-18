@@ -1,6 +1,11 @@
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
 
 public class Main {
   public static void main(String[] args) {
@@ -20,7 +25,6 @@ public class Main {
         System.out.println("Client connected");
 
         // Create a new thread to handle the client connection
-        // Pass the clientSocket to the new ClientHandler object
         ClientHandler handler = new ClientHandler(clientSocket);
         new Thread(handler).start();
       }
@@ -52,29 +56,86 @@ class ClientHandler implements Runnable {
   @Override
   public void run() {
     try {
-      // This loop handles multiple commands from the *same* client
-      while (true) {
-        byte[] input = new byte[1024];
-        
-        // read() will block until data is received
-        // or return -1 if the client disconnects
-        int bytesRead = clientSocket.getInputStream().read(input);
-        
-        if (bytesRead == -1) {
-          System.out.println("Client disconnected.");
-          break; // Exit the loop for this client
+      // Use BufferedReader to read lines (commands) from the client
+      InputStream inputStream = clientSocket.getInputStream();
+      BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+      OutputStream outputStream = clientSocket.getOutputStream();
+      
+      String line;
+
+      // Loop to read commands until the client disconnects (readLine() returns null)
+      while ((line = reader.readLine()) != null) {
+        // 1. All commands are RESP Arrays. First line is the array header.
+        // Example: *2 (for *2\r\n)
+        if (!line.startsWith("*")) {
+          System.out.println("Protocol error: Expected Array header, got: " + line);
+          continue;
         }
 
-        // Per the instructions, just send "PONG" for any command
-        clientSocket.getOutputStream().write("+PONG\r\n".getBytes());
+        // Parse array length
+        int numElements = Integer.parseInt(line.substring(1));
+        ArrayList<String> commandParts = new ArrayList<>();
+
+        // 2. Read each element (command and arguments) from the array
+        for (int i = 0; i < numElements; i++) {
+          // Read bulk string header (e.g., $4)
+          String bulkHeader = reader.readLine();
+          if (bulkHeader == null || !bulkHeader.startsWith("$")) {
+            throw new IOException("Protocol error: Expected Bulk String header");
+          }
+          
+          // Parse bulk string length
+          int length = Integer.parseInt(bulkHeader.substring(1));
+
+          // Read the actual data (e.g., "ECHO")
+          char[] data = new char[length];
+          reader.read(data, 0, length);
+          
+          // Consume the trailing \r\n
+          reader.skip(2); 
+          
+          commandParts.add(new String(data));
+        }
+
+        // 3. Process the parsed command
+        if (commandParts.isEmpty()) {
+          continue;
+        }
+
+        // Use toUpperCase() for case-insensitive command matching
+        String command = commandParts.get(0).toUpperCase();
+
+        switch (command) {
+          case "PING":
+            // Respond with a Simple String
+            outputStream.write("+PONG\r\n".getBytes());
+            break;
+
+          case "ECHO":
+            if (commandParts.size() < 2) {
+              // Handle error: not enough arguments
+              outputStream.write("-ERR wrong number of arguments for 'echo' command\r\n".getBytes());
+            } else {
+              // Get the argument to echo
+              String echoArg = commandParts.get(1);
+              // Respond with a Bulk String: $length\r\nargument\r\n
+              String response = "$" + echoArg.length() + "\r\n" + echoArg + "\r\n";
+              outputStream.write(response.getBytes());
+            }
+            break;
+          
+          default:
+            // Handle unknown command
+            outputStream.write(("-ERR unknown command '" + commandParts.get(0) + "'\r\n").getBytes());
+        }
       }
     } catch (IOException e) {
-      // Handle exceptions that occur during client communication
-      // e.g., "Connection reset by peer" if client force-quits
-      System.out.println("IOException in client handler: " + e.getMessage());
+      // This often happens when the client disconnects normally
+      System.out.println("Client disconnected or IOException: " + e.getMessage());
+    } catch (NumberFormatException e) {
+      System.out.println("Protocol error, bad number format: " + e.getMessage());
     } finally {
-      // This is crucial: ensure each client's socket is closed
-      // when its handling loop finishes (due to disconnection or error).
+      // Always close the client socket when the thread is done
       try {
         if (clientSocket != null) {
           clientSocket.close();
