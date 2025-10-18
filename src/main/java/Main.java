@@ -6,8 +6,14 @@ import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Map; // Import Map
+import java.util.concurrent.ConcurrentHashMap; // Import ConcurrentHashMap
 
 public class Main {
+  
+  // Create a thread-safe, shared key-value store
+  private static final Map<String, String> dataStore = new ConcurrentHashMap<>();
+
   public static void main(String[] args) {
     System.out.println("Logs from your program will appear here!");
 
@@ -18,14 +24,12 @@ public class Main {
       serverSocket = new ServerSocket(port);
       serverSocket.setReuseAddress(true);
 
-      // Infinitely loop to accept new client connections
       while (true) {
-        // Wait for connection from client. This blocks until a client connects.
         Socket clientSocket = serverSocket.accept();
         System.out.println("Client connected");
 
-        // Create a new thread to handle the client connection
-        ClientHandler handler = new ClientHandler(clientSocket);
+        // Pass the shared dataStore to each new ClientHandler
+        ClientHandler handler = new ClientHandler(clientSocket, dataStore);
         new Thread(handler).start();
       }
 
@@ -48,94 +52,110 @@ public class Main {
  */
 class ClientHandler implements Runnable {
   private Socket clientSocket;
+  // Field to hold the reference to the shared data store
+  private Map<String, String> dataStore;
 
-  public ClientHandler(Socket socket) {
+  // Update constructor to accept the data store
+  public ClientHandler(Socket socket, Map<String, String> dataStore) {
     this.clientSocket = socket;
+    this.dataStore = dataStore;
   }
 
   @Override
   public void run() {
     try {
-      // Use BufferedReader to read lines (commands) from the client
       InputStream inputStream = clientSocket.getInputStream();
       BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
       OutputStream outputStream = clientSocket.getOutputStream();
       
       String line;
 
-      // Loop to read commands until the client disconnects (readLine() returns null)
       while ((line = reader.readLine()) != null) {
-        // 1. All commands are RESP Arrays. First line is the array header.
-        // Example: *2 (for *2\r\n)
+        // --- RESP Parsing (same as before) ---
         if (!line.startsWith("*")) {
           System.out.println("Protocol error: Expected Array header, got: " + line);
           continue;
         }
 
-        // Parse array length
         int numElements = Integer.parseInt(line.substring(1));
         ArrayList<String> commandParts = new ArrayList<>();
 
-        // 2. Read each element (command and arguments) from the array
         for (int i = 0; i < numElements; i++) {
-          // Read bulk string header (e.g., $4)
           String bulkHeader = reader.readLine();
           if (bulkHeader == null || !bulkHeader.startsWith("$")) {
             throw new IOException("Protocol error: Expected Bulk String header");
           }
-          
-          // Parse bulk string length
           int length = Integer.parseInt(bulkHeader.substring(1));
-
-          // Read the actual data (e.g., "ECHO")
           char[] data = new char[length];
           reader.read(data, 0, length);
-          
-          // Consume the trailing \r\n
-          reader.skip(2); 
-          
+          reader.skip(2); // Consume \r\n
           commandParts.add(new String(data));
         }
+        // --- End of RESP Parsing ---
 
-        // 3. Process the parsed command
         if (commandParts.isEmpty()) {
           continue;
         }
 
-        // Use toUpperCase() for case-insensitive command matching
         String command = commandParts.get(0).toUpperCase();
 
+        // --- Command Handling ---
         switch (command) {
           case "PING":
-            // Respond with a Simple String
             outputStream.write("+PONG\r\n".getBytes());
             break;
 
           case "ECHO":
             if (commandParts.size() < 2) {
-              // Handle error: not enough arguments
               outputStream.write("-ERR wrong number of arguments for 'echo' command\r\n".getBytes());
             } else {
-              // Get the argument to echo
               String echoArg = commandParts.get(1);
-              // Respond with a Bulk String: $length\r\nargument\r\n
               String response = "$" + echoArg.length() + "\r\n" + echoArg + "\r\n";
               outputStream.write(response.getBytes());
             }
             break;
           
+          case "SET":
+            // SET key value
+            if (commandParts.size() != 3) {
+              outputStream.write("-ERR wrong number of arguments for 'set' command\r\n".getBytes());
+            } else {
+              String key = commandParts.get(1);
+              String value = commandParts.get(2);
+              dataStore.put(key, value);
+              // Respond with Simple String "OK"
+              outputStream.write("+OK\r\n".getBytes());
+            }
+            break;
+            
+          case "GET":
+            // GET key
+            if (commandParts.size() != 2) {
+              outputStream.write("-ERR wrong number of arguments for 'get' command\r\n".getBytes());
+            } else {
+              String key = commandParts.get(1);
+              String value = dataStore.get(key);
+              
+              if (value == null) {
+                // Key not found: Respond with Null Bulk String
+                outputStream.write("$-1\r\n".getBytes());
+              } else {
+                // Key found: Respond with Bulk String
+                String response = "$" + value.length() + "\r\n" + value + "\r\n";
+                outputStream.write(response.getBytes());
+              }
+            }
+            break;
+
           default:
-            // Handle unknown command
             outputStream.write(("-ERR unknown command '" + commandParts.get(0) + "'\r\n").getBytes());
         }
       }
     } catch (IOException e) {
-      // This often happens when the client disconnects normally
       System.out.println("Client disconnected or IOException: " + e.getMessage());
     } catch (NumberFormatException e) {
       System.out.println("Protocol error, bad number format: " + e.getMessage());
     } finally {
-      // Always close the client socket when the thread is done
       try {
         if (clientSocket != null) {
           clientSocket.close();
