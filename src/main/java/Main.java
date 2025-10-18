@@ -6,13 +6,16 @@ import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
-import java.util.Map; // Import Map
-import java.util.concurrent.ConcurrentHashMap; // Import ConcurrentHashMap
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Main server class.
+ */
 public class Main {
   
-  // Create a thread-safe, shared key-value store
-  private static final Map<String, String> dataStore = new ConcurrentHashMap<>();
+  // Update dataStore to hold ValueEntry objects
+  private static final Map<String, ValueEntry> dataStore = new ConcurrentHashMap<>();
 
   public static void main(String[] args) {
     System.out.println("Logs from your program will appear here!");
@@ -52,11 +55,11 @@ public class Main {
  */
 class ClientHandler implements Runnable {
   private Socket clientSocket;
-  // Field to hold the reference to the shared data store
-  private Map<String, String> dataStore;
+  // Update dataStore field type
+  private Map<String, ValueEntry> dataStore;
 
-  // Update constructor to accept the data store
-  public ClientHandler(Socket socket, Map<String, String> dataStore) {
+  // Update constructor to accept the new map type
+  public ClientHandler(Socket socket, Map<String, ValueEntry> dataStore) {
     this.clientSocket = socket;
     this.dataStore = dataStore;
   }
@@ -116,32 +119,62 @@ class ClientHandler implements Runnable {
             break;
           
           case "SET":
-            // SET key value
-            if (commandParts.size() != 3) {
+            // Must have at least SET key value (3 parts)
+            if (commandParts.size() < 3) {
               outputStream.write("-ERR wrong number of arguments for 'set' command\r\n".getBytes());
-            } else {
-              String key = commandParts.get(1);
-              String value = commandParts.get(2);
-              dataStore.put(key, value);
-              // Respond with Simple String "OK"
-              outputStream.write("+OK\r\n".getBytes());
+              break;
             }
+            
+            String key = commandParts.get(1);
+            String value = commandParts.get(2);
+            long expiryTime = -1; // Default: no expiry
+
+            // Check for optional arguments (PX)
+            // SET key value PX milliseconds (5 parts)
+            if (commandParts.size() == 5) {
+              if (commandParts.get(3).equalsIgnoreCase("PX")) {
+                try {
+                  long duration = Long.parseLong(commandParts.get(4));
+                  expiryTime = System.currentTimeMillis() + duration;
+                } catch (NumberFormatException e) {
+                  outputStream.write("-ERR value is not an integer or out of range\r\n".getBytes());
+                  break; // Don't proceed to set
+                }
+              } else {
+                // Unknown option
+                outputStream.write("-ERR syntax error\r\n".getBytes());
+                break;
+              }
+            } else if (commandParts.size() != 3) {
+              // Wrong number of args if not 3 or 5
+              outputStream.write("-ERR wrong number of arguments for 'set' command\r\n".getBytes());
+              break;
+            }
+
+            // Create the ValueEntry and put it in the map
+            ValueEntry entry = new ValueEntry(value, expiryTime);
+            dataStore.put(key, entry);
+            
+            outputStream.write("+OK\r\n".getBytes());
             break;
             
           case "GET":
-            // GET key
             if (commandParts.size() != 2) {
               outputStream.write("-ERR wrong number of arguments for 'get' command\r\n".getBytes());
             } else {
-              String key = commandParts.get(1);
-              String value = dataStore.get(key);
+              String getKey = commandParts.get(1);
+              ValueEntry getValue = dataStore.get(getKey);
               
-              if (value == null) {
-                // Key not found: Respond with Null Bulk String
+              if (getValue == null) {
+                // Key not found
+                outputStream.write("$-1\r\n".getBytes());
+              } else if (getValue.isExpired()) {
+                // Key found, but it's expired
+                dataStore.remove(getKey); // Lazy eviction
                 outputStream.write("$-1\r\n".getBytes());
               } else {
-                // Key found: Respond with Bulk String
-                String response = "$" + value.length() + "\r\n" + value + "\r\n";
+                // Key found and not expired
+                String response = "$" + getValue.value.length() + "\r\n" + getValue.value + "\r\n";
                 outputStream.write(response.getBytes());
               }
             }
@@ -164,5 +197,36 @@ class ClientHandler implements Runnable {
         System.out.println("IOException closing client socket: " + e.getMessage());
       }
     }
+  }
+}
+
+/**
+ * A helper class to store the value and its expiry time.
+ */
+class ValueEntry {
+  String value;
+  long expiryTime; // Absolute time in milliseconds when this expires
+
+  /**
+   * Creates a new ValueEntry.
+   * @param value The string value to store.
+   * @param expiryTime The absolute system time (in ms) when this entry should expire.
+   * -1 indicates no expiry.
+   */
+  public ValueEntry(String value, long expiryTime) {
+    this.value = value;
+    this.expiryTime = expiryTime;
+  }
+
+  /**
+   * Checks if this entry is expired.
+   * @return true if the entry has an expiry time and the current time is past it,
+   * false otherwise.
+   */
+  public boolean isExpired() {
+    if (expiryTime == -1) {
+      return false; // No expiry set
+    }
+    return System.currentTimeMillis() > expiryTime;
   }
 }
